@@ -1,0 +1,27 @@
+version: '2'
+
+services:
+  news:
+    build: .
+    volumes:
+    - .:/opt/:ro
+    command: python src/main.py
+    depends_on:
+    - mysql
+    env_file:
+    - .env
+  mysql:
+    image: mysql:5.7
+    command:
+    - --character-set-server=utf8
+    - --collation-server=utf8_unicode_ci
+    - --skip-character-set-client-handshake
+    environment:
+    - MYSQL_ROOT_PASSWORD=root
+    - MYSQL_DATABASE=news
+    - MYSQL_USER=user
+    - MYSQL_PASSWORD=password
+    volumes:
+    - mysql-data:/var/lib/mysql
+volumes:
+  mysql-data: {}
