@@ -1,4 +1,5 @@
-from asyncio import get_event_loop, ensure_future, wait
+from asyncio import get_event_loop, ensure_future, gather, sleep as aio_sleep
+from collections import Counter
 from concurrent.futures import TimeoutError
 from datetime import datetime
 from hashlib import sha256
@@ -10,6 +11,9 @@ from aiomysql.sa import create_engine
 from pymysql.err import IntegrityError
 from models import article as article_model
 
+
+MYSQL_CONNECTIONS = 10
+SLEEPING_TIME = 60 * 60
 db = {
     'user': 'user',
     'password': 'password',
@@ -20,7 +24,8 @@ db = {
 
 def inject_engine(fnx):
     async def _wrapper(*args, **kwargs):
-        engine = await create_engine(loop=get_event_loop(), **db)
+        engine = await create_engine(loop=get_event_loop(),
+                                     maxsize=MYSQL_CONNECTIONS, **db)
         kwargs['engine'] = engine
         result = await fnx(*args, **kwargs)
         engine.close()
@@ -39,7 +44,7 @@ async def get_sources(timeout=5):
 
 async def get_articles(source, api_key=env.get('API_KEY'), timeout=5):
     base = 'https://newsapi.org/v1/articles'
-    query_string = f'?source={source}&apiKey={api_key}'
+    query_string = f'?source={source}&apiKey={api_key}'  # noqa
     url = f'{base}{query_string}'
     async with ClientSession() as session:
         async with session.get(url, timeout=timeout) as resp:
@@ -55,10 +60,11 @@ async def write_article(source, article, engine):
 
         # i don't like this
         try:
+            await conn.execute('BEGIN')
             await conn.execute(article_model.insert().values(**dic))
             await conn.execute('COMMIT')
         except IntegrityError:
-            pass
+            return False
     return True
 
 
@@ -66,32 +72,47 @@ async def run_task(source, engine):
     try:
         resp = await get_articles(source)
     except TimeoutError:
-        return False
+        return None
     if resp['status'] == 'error':
-        return False
+        return None
     articles = [article for article in resp['articles']]
     tasks = [await write_article(source, article, engine)
              for article in articles]
-    return all(tasks)
+    counted = Counter(tasks)
+    ok, wrong = counted[True], counted[False]
+    return ok, wrong
 
 
 @inject_engine
 async def main(engine):
     sources = await get_sources()
-    len_sources = len(sources)
-
-    print(f'{len_sources} sources to process')
 
     tasks = [ensure_future(run_task(source, engine))
              for source in sources]
-    results, _ = await wait(tasks)
+    result = await gather(*tasks)
+    new = sum([x[0] for x in result if x is not None])
+    old = sum([x[1] for x in result if x is not None])
+    errors = len([x for x in result if x is None])
+    return new, old, errors, len(sources)
 
-    if all([result.result() for result in results]):
-        print(f'All {len_sources} tasks were correctly processed')
-    else:
-        print('Some tasks were not correctly processed')
 
+def log(new, old, errors, len_sources):
+    articles = new + old
+    print(f'{len_sources} sources and {articles} were processed')  # noqa
+    if new:
+        print(f'{new} new articles')
+    if errors:
+        print(f'There were {errors} errors')
+    print('')
+
+
+async def da_loop():
+    while True:
+        print(f'{datetime.now()} start')
+        result = await main()
+        log(*result)
+        await aio_sleep(SLEEPING_TIME)
 
 if __name__ == "__main__":
     loop = get_event_loop()
-    loop.run_until_complete(main())
+    loop.run_until_complete(da_loop())
